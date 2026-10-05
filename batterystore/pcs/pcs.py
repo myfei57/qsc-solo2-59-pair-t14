@@ -62,6 +62,12 @@ class Pcs:
     def protection(self) -> PcsProtection:
         return self._protection
 
+    @property
+    def derate(self) -> DerateFactor:
+        """返回当前生效的降额系数（含来源与基线元数据）。"""
+
+        return self._derate
+
     def is_tied(self) -> bool:
         """是否处于并网态。"""
 
@@ -108,10 +114,10 @@ class Pcs:
             "violations": violations,
         }
 
-    def apply_derate(self, **ratios: float) -> DerateFactor:
-        """合成降额系数并写入功率控制器。"""
+    def apply_derate(self, meta: dict | None = None, **ratios: float) -> DerateFactor:
+        """合成降额系数并写入功率控制器，可附带本次系数的来源说明。"""
 
-        self._derate = combine_ratios(**ratios)
+        self._derate = combine_ratios(meta=meta, **ratios)
         self._power.with_derate(self._derate.ratio)
         return self._derate
 
@@ -141,6 +147,7 @@ class Pcs:
             state=self._state.state,
             generation=self._state.generation,
             derate_ratio=self._derate.ratio,
+            derate_meta=self._derate.meta,
             output_kw=self._power.output_kw(),
             delivered_kw=self._power.delivered_kw(),
             reactive_kvar=self._power.reactive_kvar(),

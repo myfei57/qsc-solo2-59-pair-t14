@@ -57,8 +57,9 @@ def test_temperature_chain_refreshes_baseline(platform):
     assert report["charge_limit_ratio"] < 1.0
     replaced = platform.replace_pack_rating(pack_index=0, rating_v=3.4)
     assert replaced["ok"]
-    assert [step["action"] for step in replaced["steps"]] == ["replace_pack", "baseline_refresh"]
-    assert platform.temp.baseline.rating_v == 3.4
+    assert [step["action"] for step in replaced["steps"]] == ["replace_pack", "baseline_refresh", "derate_sync"]
+    assert platform.temp.baseline("rk-01-p1").rating_v == 3.4
+    assert platform.temp.baseline("rk-01-p2").rating_v == 3.2
 
 
 def test_cycle_and_concurrency_probes(platform):

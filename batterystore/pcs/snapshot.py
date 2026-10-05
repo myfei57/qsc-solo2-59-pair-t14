@@ -12,6 +12,7 @@ class PcsSnapshot:
     state: str
     generation: int
     derate_ratio: float
+    derate_meta: dict
     output_kw: float
     delivered_kw: float
     reactive_kvar: float
@@ -30,6 +31,7 @@ class PcsSnapshot:
             "state": self.state,
             "generation": self.generation,
             "derate_ratio": round(self.derate_ratio, 4),
+            "derate_meta": dict(self.derate_meta),
             "output_kw": round(self.output_kw, 3),
             "delivered_kw": round(self.delivered_kw, 3),
             "reactive_kvar": round(self.reactive_kvar, 3),

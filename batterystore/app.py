@@ -1,9 +1,10 @@
 """平台装配与控制循环。
 
 ``Platform`` 把各组件按真实联控链接起来，并暴露五类动作：并离网切换、充放电、
-均衡、温度采集与消防联动。控制循环每个周期做六件事：采集温度并刷新降额基线、
-核对保护判据、核对各簇就绪、按校准估算 SOC、滚动配额周期、把计数落盘。跨模块
-动作都由 :mod:`batterystore.ops` 的编排一次性走完并写审计。
+均衡、温度采集与消防联动。控制循环每个周期做七件事：采集温度并按包刷新降额
+基线、把温控降额同步到 PCS（与充电电流上限、冷却条件同一切换）、核对保护
+判据、核对各簇就绪、按校准估算 SOC、滚动配额周期、把计数落盘。跨模块动作
+都由 :mod:`batterystore.ops` 的编排一次性走完并写审计。
 """
 
 from __future__ import annotations
@@ -399,7 +400,7 @@ class Platform:
             op_id = self.ids.next()
             rack = self._rack(rack_id)
             rack.apply_temperature(temperature_c)
-            applied = self.temp.apply_temperature(temperature_c, self.clock.now(), rack.rating_v(), rack.rating_epoch)
+            applied = self.temp.apply_temperature(temperature_c, self.clock.now(), rack.pack_ratings())
             cooled = self.temp.cool(dt)
             combined = self.temp.combined_ratio(grid=1.0)
             steps = [
@@ -415,27 +416,59 @@ class Platform:
                     },
                 },
             ]
-            ratio = self.temp.charge_limit_ratio()
-            self.pcs.apply_derate(temperature=ratio, grid=1.0)
+            sync = self._sync_temp_derate()
             report = {"station": self.station, "ok": True, "steps": steps, "violations": []}
             summary = self._record_operation(op_id, "temperature", report)
-            return {**report, **summary, "charge_limit_ratio": round(ratio, 4)}
+            return {**report, **summary, "charge_limit_ratio": round(sync["ratio"], 4)}
+
+    def _sync_temp_derate(self) -> dict:
+        """按最新基线把温控分量重新下发到 PCS，并网限额等其它分量保持不动。
+
+        基线刷新、降额系数、充电电流上限必须同一切换，不能出现降额放开了
+        电流还按旧限压着的窗口；返回的元数据说明这次用的是哪一代基线。
+        """
+
+        detail = self.temp.charge_limit_detail()
+        meta = {key: value for key, value in detail.items() if key != "ratio"}
+        others = {key: value for key, value in self.pcs.derate.sources.items() if key != "temperature"}
+        factor = self.pcs.apply_derate(meta=meta, temperature=detail["ratio"], **others)
+        return {"ratio": detail["ratio"], "meta": meta, "derate": factor.as_dict()}
 
     def replace_pack_rating(self, pack_index: int = 0, rating_v: float = 3.35, rack_id: str | None = None) -> dict:
-        """更换整包电芯并立即刷新降额基线。"""
+        """更换整包电芯：局部重标该包基线，降额、电流上限、冷却条件同一切换。"""
 
         with self._lock:
             op_id = self.ids.next()
             rack = self._rack(rack_id)
+            before = {
+                "charge_limit_ratio": round(self.temp.charge_limit_ratio(), 4),
+                "pcs_derate_ratio": round(self.pcs.derate.ratio, 4),
+                "cooling": self.temp.cooler.is_running(),
+            }
             change = rack.replace_pack_rating(pack_index, rating_v)
-            baseline = self.temp.apply_temperature(rack.temperature_c(), self.clock.now(), rack.rating_v(), rack.rating_epoch)
+            baseline = self.temp.apply_temperature(rack.temperature_c(), self.clock.now(), rack.pack_ratings())
+            sync = self._sync_temp_derate()
+            after = {
+                "charge_limit_ratio": round(self.temp.charge_limit_ratio(), 4),
+                "pcs_derate_ratio": round(self.pcs.derate.ratio, 4),
+                "cooling": self.temp.cooler.is_running(),
+            }
             steps = [
                 {"component": "rack", "action": "replace_pack", "detail": change},
                 {"component": "temp", "action": "baseline_refresh", "detail": baseline},
+                {
+                    "component": "pcs",
+                    "action": "derate_sync",
+                    "detail": {
+                        "previous_ratio": before["pcs_derate_ratio"],
+                        "ratio": sync["ratio"],
+                        **sync["meta"],
+                    },
+                },
             ]
             report = {"station": self.station, "ok": True, "steps": steps, "violations": []}
             summary = self._record_operation(op_id, "replace_pack", report)
-            return {**report, **summary}
+            return {**report, **summary, "before": before, "after": after}
 
     def calibrate_soc(self, soc_pct: float, source: str = "manual") -> dict:
         """登记一次 SOC 校准并按新基准重估。"""
@@ -563,7 +596,7 @@ class Platform:
             ratios: dict[str, float] = {}
             trips: list[str] = []
             for rack_id, rack in self.racks.items():
-                applied = self.temp.apply_temperature(rack.temperature_c(), now, rack.rating_v(), rack.rating_epoch)
+                applied = self.temp.apply_temperature(rack.temperature_c(), now, rack.pack_ratings())
                 temperatures[rack_id] = applied["temperature_c"]
                 ratios[rack_id] = round(self.temp.charge_limit_ratio(), 4)
                 self.trend.append(f"{rack_id}.temperature", now, rack.temperature_c())
@@ -575,6 +608,7 @@ class Platform:
                 self.bms.ready(rack)
                 estimate = self.soc.value(now)
                 rack.set_soc(estimate.soc_pct)
+            sync = self._sync_temp_derate()
             rolled = self.quota.roll(now)
             self.grid.monitor_frequency(50.0, now)
             self._persist()
@@ -582,6 +616,8 @@ class Platform:
                 "cycle": self._cycles,
                 "temperatures": temperatures,
                 "charge_limit_ratio": ratios,
+                "pcs_derate_ratio": round(self.pcs.derate.ratio, 4),
+                "baseline_epoch": sync["meta"]["baseline_epoch"],
                 "trips": trips,
                 "quota_rolled": rolled["rolled"],
                 "pcs_state": self.pcs.state_machine.state,
@@ -719,8 +755,8 @@ class Platform:
         return {**self.pcs.snapshot().as_dict(), "mode_matrix": self.pcs.state_machine.table.matrix()}
 
     def temp_snapshot(self) -> dict:
-        rack = self._rack(DEFAULT_RACK)
-        return self.temp.snapshot(self.clock.now(), rack.rating_epoch).as_dict()
+        packs = [view for rack in self.racks.values() for view in rack.pack_ratings()]
+        return self.temp.snapshot(self.clock.now(), packs).as_dict()
 
     def fire_snapshot(self) -> dict:
         return self.fire.snapshot().as_dict()

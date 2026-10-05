@@ -30,7 +30,9 @@ def charge_rack(
     flow: list[dict] = []
     violations: list[str] = []
 
-    derate_ratio = temp.charge_limit_ratio()
+    limit = temp.charge_limit_detail()
+    derate_ratio = limit["ratio"]
+    meta = {key: value for key, value in limit.items() if key != "ratio"}
     plan = bms.charge_plan(
         rack,
         pcs.limits,
@@ -42,8 +44,8 @@ def charge_rack(
     if not plan.allowed:
         return {"station": station, "ok": False, "steps": flow, "violations": list(plan.reasons)}
 
-    derate = pcs.apply_derate(temperature=derate_ratio, grid=1.0)
-    flow.append({"component": "temp", "action": "derate", "detail": derate.as_dict()})
+    derate = pcs.apply_derate(meta=meta, temperature=derate_ratio, grid=1.0)
+    flow.append({"component": "temp", "action": "derate", "detail": {**derate.as_dict(), **meta}})
 
     ladder = pcs.ladder
     ladder.begin(plan.current_a)

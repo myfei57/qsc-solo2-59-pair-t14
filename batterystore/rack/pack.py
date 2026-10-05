@@ -17,10 +17,22 @@ class Pack:
             raise ValueError("电池包不能为空")
         self._pack_id = pack_id
         self._cells = list(cells)
+        self._rating_epoch = 0
 
     @property
     def pack_id(self) -> str:
         return self._pack_id
+
+    @property
+    def rating_epoch(self) -> int:
+        """返回包级额定值代际，整包换电芯加一。"""
+
+        return self._rating_epoch
+
+    def rating_v(self) -> float:
+        """返回包当前额定值（整包为同规格电芯）。"""
+
+        return self._cells[0].rating_v
 
     def cells(self) -> list[Cell]:
         """返回包内单体（按注册顺序）。"""
@@ -51,7 +63,18 @@ class Pack:
     def apply_rating(self, rating_v: float) -> list[float]:
         """整包更换同规格电芯，返回每个单体被替换掉的旧额定值。"""
 
-        return [cell.apply_rating(rating_v) for cell in self._cells]
+        previous = [cell.apply_rating(rating_v) for cell in self._cells]
+        self._rating_epoch += 1
+        return previous
+
+    def rating_view(self) -> dict:
+        """返回温控基线绑定所需的额定值视图（包标识 + 额定值 + 代际）。"""
+
+        return {
+            "pack_id": self._pack_id,
+            "rating_v": round(self.rating_v(), 4),
+            "rating_epoch": self._rating_epoch,
+        }
 
     def as_dict(self) -> dict:
         return {

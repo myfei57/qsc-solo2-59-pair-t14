@@ -1,9 +1,11 @@
 """电池簇。
 
 一簇由若干电池包串联组成，对外提供四件事：压差与温差度量、SOC 读写、
-额定值更新（换电芯）与快照。额定值更新会返回一条变更记录，温控基线据此
-判定自己是否需要立即刷新——这是"换完电芯还按旧额定值降额"这类问题的
-唯一正确解法。
+额定值更新（换电芯）与快照。额定值更新采用**局部重标**口径：只改写被换
+那一包的额定值与包级代际，其余包的代际不动。混装簇里若整簇统一重标，
+没换的旧包也会被绑到新额定值代际上——统一到新款则旧包该压不压，统一到
+旧款则新包正常温度被误判高温；局部重标让每包基线始终绑定自己这代电芯
+的额定值，温控降额据此逐包核对、簇级取最严。
 """
 
 from __future__ import annotations
@@ -26,7 +28,6 @@ class Rack:
         self._packs = list(packs)
         self._zone = zone
         self._soc_pct: float = float(packs[0].cells()[0].soc_pct)
-        self._rating_v: float = float(packs[0].cells()[0].rating_v)
         self._rating_epoch = 0
 
     @property
@@ -39,9 +40,14 @@ class Rack:
 
     @property
     def rating_epoch(self) -> int:
-        """返回额定值代际，换一次电芯加一。"""
+        """返回簇级额定值变更代际，每换一次电芯加一。"""
 
         return self._rating_epoch
+
+    def pack_ratings(self) -> list[dict]:
+        """返回各包额定值视图，温控基线按包逐一绑定。"""
+
+        return [pack.rating_view() for pack in self._packs]
 
     def packs(self) -> list[Pack]:
         """返回簇内电池包。"""
@@ -85,9 +91,9 @@ class Rack:
         return max(cell.temperature_c for cell in self.cells())
 
     def rating_v(self) -> float:
-        """返回整簇当前额定值。"""
+        """返回整簇对外口径的额定值：混装簇没有单一额定值，取各包最小值（最保守）。"""
 
-        return self._rating_v
+        return min(pack.rating_v() for pack in self._packs)
 
     def metrics(self) -> RackMetrics:
         """返回簇级度量。"""
@@ -105,17 +111,17 @@ class Rack:
         return usable_energy_kwh(self.cells(), limits, capacity_ah)
 
     def replace_pack_rating(self, pack_index: int, rating_v: float) -> dict:
-        """更换某包的整包电芯，返回变更记录。"""
+        """更换某包的整包电芯：只重标该包（局部重标），返回变更记录。"""
 
         if not 0 <= pack_index < len(self._packs):
             raise IndexError(f"电池包序号越界: {pack_index}")
         pack = self._packs[pack_index]
         previous = pack.apply_rating(rating_v)
-        self._rating_v = float(rating_v)
         self._rating_epoch += 1
         return {
             "rack_id": self._rack_id,
             "pack_id": pack.pack_id,
+            "pack_rating_epoch": pack.rating_epoch,
             "previous_rating_v": round(previous[0], 4),
             "rating_v": round(rating_v, 4),
             "rating_epoch": self._rating_epoch,
