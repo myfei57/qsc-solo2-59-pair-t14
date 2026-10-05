@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
-from .baseline import TempBaseline
+from .baseline import BaselineStamp, ThermalProfile, TempBaseline, profile_for_rating
 from .control import Cooler
 from .curve import DerateCurve
 from .snapshot import TempSnapshot
 from .temp import TempControl
 
-__all__ = ["Cooler", "DerateCurve", "TempBaseline", "TempControl", "TempSnapshot"]
+__all__ = [
+    "BaselineStamp",
+    "Cooler",
+    "DerateCurve",
+    "TempBaseline",
+    "TempControl",
+    "TempSnapshot",
+    "ThermalProfile",
+    "profile_for_rating",
+]

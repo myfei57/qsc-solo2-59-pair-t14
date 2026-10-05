@@ -15,6 +15,8 @@ class RackSnapshot:
     zone: str
     soc_pct: float
     rating_epoch: int
+    rating_map: dict
+    mixed_rating: bool
     metrics: RackMetrics
 
     def as_dict(self) -> dict:
@@ -23,5 +25,7 @@ class RackSnapshot:
             "zone": self.zone,
             "soc_pct": round(self.soc_pct, 2),
             "rating_epoch": self.rating_epoch,
+            "rating_map": dict(self.rating_map),
+            "mixed_rating": self.mixed_rating,
             "metrics": self.metrics.as_dict(),
         }

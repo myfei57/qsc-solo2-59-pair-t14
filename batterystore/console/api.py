@@ -218,6 +218,7 @@ class Api:
             pack_index=_as_int(body, "pack_index", 0),
             rating_v=_as_float(body, "rating_v", 3.35),
             rack_id=body.get("rack_id"),
+            scope=str(body.get("scope", "local")),
         )
 
     def _calibrate(self, params: dict, body: dict) -> dict:

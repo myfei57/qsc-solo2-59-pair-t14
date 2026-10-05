@@ -59,6 +59,56 @@ def test_baseline_expires_by_time(platform, clock):
     assert platform.temp.charge_limit_ratio() == pytest.approx(platform.temp.ratio())
 
 
+def test_baseline_refresh_switches_three_limits_together(platform, clock):
+    platform.start()
+    sampled = platform.sample_temperature(temperature_c=41.0)
+    assert sampled["charge_limit_ratio"] < 1.0
+    assert platform.pcs.ladder.max_a < platform.config.pcs.current_max_a
+
+    refreshed = platform.replace_pack_rating(pack_index=0, rating_v=3.4, scope="cluster")
+    policy = refreshed["thermal_policy"]
+
+    assert policy["scope"] == "cluster"
+    assert policy["generation"] == "rating-3.4000v"
+    assert policy["charge_limit_ratio"] == 1.0
+    assert policy["cooling_start_c"] == 42.5
+    assert platform.pcs.thermal_policy()["derate"]["ratio"] == 1.0
+    assert platform.pcs.ladder.max_a == 188.24
+    assert policy["previous_policy"]["charge_limit_ratio"] < 1.0
+
+
+def test_mixed_cluster_uses_local_refresh_and_keeps_old_pack_conservative(platform):
+    platform.start()
+    platform.sample_temperature(temperature_c=41.0)
+    refreshed = platform.replace_pack_rating(pack_index=0, rating_v=3.4)
+    policy = refreshed["thermal_policy"]
+
+    assert refreshed["steps"][0]["detail"]["scope"] == "local"
+    assert policy["selected_refresh_scope"] == "local"
+    assert set(policy["generations"]) == {"rating-3.2000v", "rating-3.4000v"}
+    assert policy["generation"] == "rating-3.2000v"
+    assert policy["governing_pack_id"] != "rk-01-p1"
+    assert policy["charge_limit_ratio"] < 1.0
+    assert policy["cooling_start_c"] == platform.config.temp.derate_start_c
+    with pytest.raises(ValueError):
+        platform.replace_pack_rating(pack_index=1, rating_v=3.4, scope="cluster")
+
+
+def test_thermal_audit_keeps_before_and_after_baselines(platform):
+    platform.start()
+    platform.sample_temperature(temperature_c=30.0)
+    platform.replace_pack_rating(pack_index=0, rating_v=3.4)
+
+    records = platform.audit.query(action="baseline_refresh_committed")
+    payload = records[0]["payload"]
+    assert payload["before"]["mixed"] is False
+    assert payload["after"]["rk-01-p1"]["rating_v"] == 3.4
+    assert payload["generation"] == "rating-3.4000v"
+    assert payload["switched_together"]["charge_current_max_a"] == 188.24
+    assert platform.temp.baseline.history()[-1]["before"]["profile"]["rating_v"] == 3.2
+    assert platform.pcs.thermal_history()[-1]["derate"]["ratio"] == 1.0
+
+
 def test_charge_limit_uses_floor_before_first_calibration(platform):
     baseline = type(platform.temp.baseline)(platform.config.temp.baseline_ttl_s)
     assert baseline.epoch == 0

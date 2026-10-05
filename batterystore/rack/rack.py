@@ -26,7 +26,7 @@ class Rack:
         self._packs = list(packs)
         self._zone = zone
         self._soc_pct: float = float(packs[0].cells()[0].soc_pct)
-        self._rating_v: float = float(packs[0].cells()[0].rating_v)
+        self._rating_v: float = min(pack.rating_v() for pack in packs)
         self._rating_epoch = 0
 
     @property
@@ -47,6 +47,26 @@ class Rack:
         """返回簇内电池包。"""
 
         return list(self._packs)
+
+    def pack(self, pack_index: int) -> Pack:
+        """按序号取电池包。"""
+
+        if not 0 <= pack_index < len(self._packs):
+            raise IndexError(f"电池包序号越界: {pack_index}")
+        return self._packs[pack_index]
+
+    def rating_map(self) -> dict[str, dict]:
+        """返回每个包的额定值和额定值代际。"""
+
+        return {
+            pack.pack_id: {"rating_v": round(pack.rating_v(), 4), "rating_epoch": pack.rating_epoch}
+            for pack in self._packs
+        }
+
+    def pack_ratings(self) -> dict[str, tuple[float, int]]:
+        """供温控批量读取的包额定值。"""
+
+        return {pack.pack_id: (pack.rating_v(), pack.rating_epoch) for pack in self._packs}
 
     def cells(self) -> list[Cell]:
         """返回簇内全部单体。"""
@@ -79,15 +99,37 @@ class Rack:
             pack.apply_temperature(temperature_c)
         return float(temperature_c)
 
+    def apply_pack_temperatures(self, readings: dict[str, float]) -> dict[str, float]:
+        """按包写入温度采集。"""
+
+        applied: dict[str, float] = {}
+        for pack in self._packs:
+            value = readings.get(pack.pack_id)
+            if value is None:
+                continue
+            pack.apply_temperature(value)
+            applied[pack.pack_id] = float(value)
+        return applied
+
+    def pack_temperatures(self) -> dict[str, float]:
+        """返回每包最高单体温度。"""
+
+        return {pack.pack_id: pack.hottest().temperature_c for pack in self._packs}
+
     def temperature_c(self) -> float:
         """返回簇内最高单体温度。"""
 
         return max(cell.temperature_c for cell in self.cells())
 
     def rating_v(self) -> float:
-        """返回整簇当前额定值。"""
+        """返回簇内最保守的当前额定值（混装时取最小额定值）。"""
 
-        return self._rating_v
+        return min(pack.rating_v() for pack in self._packs)
+
+    def is_mixed_rating(self) -> bool:
+        """簇内是否存在不同代际额定值。"""
+
+        return len({round(pack.rating_v(), 9) for pack in self._packs}) > 1
 
     def metrics(self) -> RackMetrics:
         """返回簇级度量。"""
@@ -104,22 +146,51 @@ class Rack:
 
         return usable_energy_kwh(self.cells(), limits, capacity_ah)
 
-    def replace_pack_rating(self, pack_index: int, rating_v: float) -> dict:
-        """更换某包的整包电芯，返回变更记录。"""
+    def replace_pack_rating(self, pack_index: int, rating_v: float, scope: str = "local") -> dict:
+        """更换某包的整包电芯，返回变更记录。
 
+        local 只改实际更换的包；cluster 是整簇统一重标，要求簇内最终额定值
+        完全一致。两种口径的混装结果不同，记录里必须保留所选 scope。
+        """
+
+        if scope not in {"local", "cluster"}:
+            raise ValueError("额定值刷新口径必须是 local 或 cluster")
         if not 0 <= pack_index < len(self._packs):
             raise IndexError(f"电池包序号越界: {pack_index}")
-        pack = self._packs[pack_index]
-        previous = pack.apply_rating(rating_v)
-        self._rating_v = float(rating_v)
+        before = {
+            "rating_map": self.rating_map(),
+            "rating_v": round(self.rating_v(), 4),
+            "rating_epoch": self._rating_epoch,
+            "mixed": self.is_mixed_rating(),
+        }
+        if scope == "cluster" and before["mixed"]:
+            raise ValueError("混装簇不能整簇统一重标；请对实际更换的包使用 local")
+        changes: list[dict] = []
+        targets = range(len(self._packs)) if scope == "cluster" else [pack_index]
+        for index in targets:
+            pack = self._packs[index]
+            change = pack.apply_rating(rating_v)
+            change["pack_index"] = index
+            changes.append(change)
+        if scope == "cluster" and self.is_mixed_rating():
+            raise ValueError("整簇统一重标后仍存在混装额定值")
+        self._rating_v = self.rating_v()
         self._rating_epoch += 1
         return {
             "rack_id": self._rack_id,
-            "pack_id": pack.pack_id,
-            "previous_rating_v": round(previous[0], 4),
-            "rating_v": round(rating_v, 4),
+            "pack_id": self._packs[pack_index].pack_id,
+            "scope": scope,
+            "selected_refresh_scope": scope,
+            "reason": "mixed_cluster_uses_local" if self.is_mixed_rating() else "uniform_cluster",
+            "previous_rating_v": round(changes[0]["previous_rating_v"], 4),
+            "rating_v": round(float(rating_v), 4),
+            "effective_rating_v": round(self.rating_v(), 4),
             "rating_epoch": self._rating_epoch,
-            "cells": len(previous),
+            "cells": changes[0]["cells"],
+            "changed_packs": changes,
+            "rating_map": self.rating_map(),
+            "mixed": self.is_mixed_rating(),
+            "before": before,
         }
 
     def snapshot(self) -> RackSnapshot:
@@ -130,5 +201,7 @@ class Rack:
             zone=self._zone,
             soc_pct=self._soc_pct,
             rating_epoch=self._rating_epoch,
+            rating_map=self.rating_map(),
+            mixed_rating=self.is_mixed_rating(),
             metrics=self.metrics(),
         )

@@ -17,10 +17,17 @@ class Pack:
             raise ValueError("电池包不能为空")
         self._pack_id = pack_id
         self._cells = list(cells)
+        self._rating_epoch = 0
 
     @property
     def pack_id(self) -> str:
         return self._pack_id
+
+    @property
+    def rating_epoch(self) -> int:
+        """返回本包电芯额定值代际。"""
+
+        return self._rating_epoch
 
     def cells(self) -> list[Cell]:
         """返回包内单体（按注册顺序）。"""
@@ -31,6 +38,11 @@ class Pack:
         """返回包电压。"""
 
         return sum(cell.voltage_v for cell in self._cells)
+
+    def rating_v(self) -> float:
+        """返回本包当前额定值。"""
+
+        return float(self._cells[0].rating_v)
 
     def weakest(self) -> Cell:
         """返回电压最低的单体。"""
@@ -48,10 +60,20 @@ class Pack:
         for cell in self._cells:
             cell.update(temperature_c=float(temperature_c))
 
-    def apply_rating(self, rating_v: float) -> list[float]:
-        """整包更换同规格电芯，返回每个单体被替换掉的旧额定值。"""
+    def apply_rating(self, rating_v: float) -> dict:
+        """整包更换同规格电芯，返回新旧额定值与代际。"""
 
-        return [cell.apply_rating(rating_v) for cell in self._cells]
+        previous = [cell.apply_rating(rating_v) for cell in self._cells]
+        self._rating_epoch += 1
+        return {
+            "pack_id": self._pack_id,
+            "previous_rating_v": previous[0],
+            "rating_v": float(rating_v),
+            "previous_rating_epoch": self._rating_epoch - 1,
+            "rating_epoch": self._rating_epoch,
+            "cells": len(previous),
+            "previous_ratings_v": previous,
+        }
 
     def as_dict(self) -> dict:
         return {

@@ -18,6 +18,7 @@ class CurrentLadder:
             raise ValueError("阶梯步长必须为正")
         self._step_a = float(step_a)
         self._tolerance_a = float(tolerance_a)
+        self._configured_max_a = float(max_a)
         self._max_a = float(max_a)
         self._current_a = 0.0
         self._target_a = 0.0
@@ -34,6 +35,43 @@ class CurrentLadder:
     @property
     def tolerance_a(self) -> float:
         return self._tolerance_a
+
+    @property
+    def configured_max_a(self) -> float:
+        """返回设备额定最大电流，不受热策略临时上限影响。"""
+
+        return self._configured_max_a
+
+    @property
+    def max_a(self) -> float:
+        """返回当前生效的充电电流上限。"""
+
+        return self._max_a
+
+    def set_max_a(self, max_a: float) -> dict:
+        """原子切换充电电流上限，并立即夹住目标和实际电流。"""
+
+        limit = max(0.0, min(self._configured_max_a, float(max_a)))
+        previous = self._max_a
+        self._max_a = limit
+        self._target_a = min(self._target_a, self._max_a)
+        if self._current_a > self._max_a:
+            self._current_a = self._max_a
+            self._lowers += 1
+        self._voltage_ok = False
+        self._sequence.append(
+            {
+                "action": "thermal_limit",
+                "previous_max_a": round(previous, 3),
+                "max_a": round(self._max_a, 3),
+                "current_a": round(self._current_a, 3),
+            }
+        )
+        return {
+            "previous_max_a": round(previous, 3),
+            "max_a": round(self._max_a, 3),
+            "current_a": round(self._current_a, 3),
+        }
 
     def current_a(self) -> float:
         """返回当前电流。"""

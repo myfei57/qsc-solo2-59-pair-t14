@@ -37,6 +37,7 @@ def charge_rack(
         balance_complete=balance.is_complete(),
         temp_derate_ratio=derate_ratio,
         balance_min_delta_mv=balance.limits.target_delta_mv,
+        current_max_a=pcs.ladder.max_a,
     )
     flow.append({"component": "bms", "action": "charge_plan", "detail": plan.as_dict()})
     if not plan.allowed:

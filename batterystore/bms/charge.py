@@ -23,6 +23,7 @@ class ChargePlan:
     current_a: float
     headroom_mv: float
     derate_ratio: float
+    current_max_a: float = 0.0
     reasons: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
@@ -32,6 +33,7 @@ class ChargePlan:
             "current_a": round(self.current_a, 3),
             "headroom_mv": round(self.headroom_mv, 2),
             "derate_ratio": round(self.derate_ratio, 4),
+            "current_max_a": round(self.current_max_a, 3),
             "reasons": list(self.reasons),
         }
 
@@ -46,6 +48,7 @@ def build_charge_plan(
     temp_derate_ratio: float,
     balance_min_delta_mv: float,
     delta_mv: float,
+    current_max_a: float | None = None,
 ) -> ChargePlan:
     """按均衡、降额与电压裕度构造充电计划。"""
 
@@ -60,7 +63,9 @@ def build_charge_plan(
         reasons.append("cell_delta_high")
 
     headroom = charge_headroom_mv(rack, rack_limits)
-    allowed_current = current_for_headroom(headroom, pcs_limits) * max(0.0, temp_derate_ratio)
+    thermal_current_max = float(current_max_a) if current_max_a is not None else float(pcs_limits.current_max_a)
+    thermal_current_scale = thermal_current_max / pcs_limits.current_max_a
+    allowed_current = current_for_headroom(headroom, pcs_limits) * thermal_current_scale * max(0.0, temp_derate_ratio)
     if allowed_current <= 0.0:
         reasons.append("voltage_headroom_exhausted")
     return ChargePlan(
@@ -69,5 +74,6 @@ def build_charge_plan(
         current_a=allowed_current,
         headroom_mv=headroom,
         derate_ratio=temp_derate_ratio,
+        current_max_a=thermal_current_max,
         reasons=reasons,
     )

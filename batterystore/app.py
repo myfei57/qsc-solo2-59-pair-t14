@@ -100,7 +100,16 @@ class Platform:
 
         self.bms = Bms(self.config.bms, self.clock, self.config.rack, self.config.soc.calibrate_ttl_s)
         self.pcs = Pcs(self.config.pcs)
-        self.temp = TempControl(self.config.temp)
+        self.temp_controls = {
+            rack_id: TempControl(
+                self.config.temp,
+                reference_rating_v=self.config.rack.cell_nominal_v,
+                configured_current_max_a=self.config.pcs.current_max_a,
+                absolute_full_c=self.config.rack.temp_trip_c,
+            )
+            for rack_id in self.racks
+        }
+        self.temp = self.temp_controls[DEFAULT_RACK]
         self.fire = FireLinkage(self.config.fire, [f"Z{i + 1}" for i in range(self.config.fire.zone_count)])
         self.grid = GridTie(self.config.grid)
         self.soc = SocEstimator(self.config.soc, self.bms.calibration)
@@ -169,6 +178,89 @@ class Platform:
         if key not in self.racks:
             raise KeyError(f"未知的簇: {key}")
         return self.racks[key]
+
+    def _temp(self, rack_id: str | None = None) -> TempControl:
+        """返回指定簇的温控器；缺省与单簇测试入口保持一致。"""
+
+        return self.temp_controls[rack_id or DEFAULT_RACK]
+
+    def _pack_readings(self, rack: Rack) -> dict[str, tuple[float, float, int]]:
+        """组装 pack_id -> (温度, 额定值, 包代际)。"""
+
+        return {
+            pack_id: (
+                rack.pack_temperatures().get(pack_id, rack.temperature_c()),
+                rating[0],
+                rating[1],
+            )
+            for pack_id, rating in rack.pack_ratings().items()
+        }
+
+    def _activate_station_thermal_policy(self) -> dict:
+        """跨簇取最严热策略，并把降额与电流上限作为一份事务提交给 PCS。"""
+
+        policies = {rack_id: temp.policy() for rack_id, temp in self.temp_controls.items()}
+        active = {rack_id: policy for rack_id, policy in policies.items() if policy is not None}
+        if not active:
+            return {}
+        strictest_id = min(active, key=lambda rack_id: active[rack_id]["charge_limit_ratio"])
+        strictest = active[strictest_id]
+        current_ratio = min(policy["charge_current_ratio"] for policy in active.values())
+        current_max = min(
+            policy["charge_current_max_a"]
+            for policy in active.values()
+            if policy["charge_current_max_a"] is not None
+        )
+        policy = {
+            **strictest,
+            "charge_current_ratio": current_ratio,
+            "charge_current_max_a": round(current_max, 3),
+            "racks": {
+                rack_id: {
+                    "ratio": item["charge_limit_ratio"],
+                    "current_ratio": item["charge_current_ratio"],
+                    "generation": item["generation"],
+                    "governing_pack_id": item["governing_pack_id"],
+                    "scope": item["scope"],
+                }
+                for rack_id, item in active.items()
+            },
+        }
+        applied = self.pcs.apply_thermal_policy(policy)
+        return {"policy": policy, "applied": applied}
+
+    def _publish_thermal_audit(self, op_id: str, action: str, change: dict, policy: dict, applied: dict) -> None:
+        """把刷新前后热策略作为嵌套审计载荷完整落盘。"""
+
+        self.bus.publish(
+            Event.of(
+                "temp",
+                "temp",
+                action,
+                station=self.station,
+                op_id=op_id,
+                severity="notice",
+                message="热策略三项已同事务切换",
+                before=change.get("before"),
+                after=change.get("after", change.get("rating_map")),
+                selection={
+                    "scope": policy["scope"],
+                    "selected_refresh_scope": policy["selected_refresh_scope"],
+                    "reason": policy.get("selection_reason", policy["reason"]),
+                },
+                switched_together={
+                    "derate_ratio": policy["charge_limit_ratio"],
+                    "charge_current_max_a": policy["charge_current_max_a"],
+                    "cooling_start_c": policy["cooling_start_c"],
+                    "cooling_stop_c": policy["cooling_stop_c"],
+                },
+                generation=policy["generation"],
+                generations=policy["generations"],
+                governing_pack_id=policy["governing_pack_id"],
+                policy=policy,
+                pcs=applied,
+            )
+        )
 
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
         """把编排步骤逐条写审计，并记一条汇总事件。"""
@@ -346,6 +438,9 @@ class Platform:
         with self._lock:
             op_id = self.ids.next()
             rack = self._rack(rack_id)
+            temp = self._temp(rack_id)
+            temp.apply_pack_temperatures(self._pack_readings(rack), self.clock.now(), reason="charge_precheck")
+            self._activate_station_thermal_policy()
             report = charge_rack(
                 self.pcs,
                 self.bms,
@@ -393,15 +488,32 @@ class Platform:
             return {**report, **summary}
 
     def sample_temperature(self, rack_id: str | None = None, temperature_c: float = 30.0, dt: float = 5.0) -> dict:
-        """温控降额编排：温度采集 → 基线读取 → 降额 → 充电限制。"""
+        """温控降额编排：温度采集 → 基线读取 → 降额／冷却／电流同事务切换。"""
 
         with self._lock:
             op_id = self.ids.next()
             rack = self._rack(rack_id)
+            temp = self._temp(rack_id)
             rack.apply_temperature(temperature_c)
-            applied = self.temp.apply_temperature(temperature_c, self.clock.now(), rack.rating_v(), rack.rating_epoch)
-            cooled = self.temp.cool(dt)
-            combined = self.temp.combined_ratio(grid=1.0)
+            policy = temp.apply_pack_temperatures(self._pack_readings(rack), self.clock.now())
+            thermal = self._activate_station_thermal_policy()
+            cooled = temp.cool(dt)
+            applied = {
+                "temperature_c": round(temperature_c, 2),
+                "ratio": policy["charge_limit_ratio"],
+                "band": temp.curve.band(temperature_c, temp.governing_profile()),
+                "baseline_refreshed": bool(policy["refreshed_packs"]),
+                "refresh": policy["refreshed_packs"],
+                "generation": policy["generation"],
+                "generations": policy["generations"],
+                "selected_refresh_scope": policy["selected_refresh_scope"],
+                "cooling": policy["cooling_required"],
+                "cooling_start_c": policy["cooling_start_c"],
+                "cooling_stop_c": policy["cooling_stop_c"],
+                "current_limit": thermal.get("applied", {}).get("current_limit"),
+                "policy_epoch": policy["policy_epoch"],
+            }
+            combined = self.pcs.thermal_policy()["derate"] if self.pcs.thermal_policy() else temp.combined_ratio(grid=1.0)
             steps = [
                 {"component": "rack", "action": "temperature", "detail": {"temperature_c": round(temperature_c, 2)}},
                 {"component": "temp", "action": "derate", "detail": applied},
@@ -410,32 +522,77 @@ class Platform:
                     "action": "cool",
                     "detail": {
                         "temperature_c": round(cooled, 2),
-                        "cooling": self.temp.cooler.is_running(),
+                        "cooling": temp.cooler.is_running(),
                         "combined": combined,
+                        "current_limit": thermal.get("applied", {}).get("current_limit"),
                     },
                 },
             ]
-            ratio = self.temp.charge_limit_ratio()
-            self.pcs.apply_derate(temperature=ratio, grid=1.0)
+            ratio = temp.charge_limit_ratio()
+            self._publish_thermal_audit(
+                op_id,
+                "thermal_policy_committed",
+                {"before": None, "after": rack.rating_map(), "reason": "temperature_sample"},
+                policy,
+                thermal.get("applied", {}),
+            )
             report = {"station": self.station, "ok": True, "steps": steps, "violations": []}
             summary = self._record_operation(op_id, "temperature", report)
-            return {**report, **summary, "charge_limit_ratio": round(ratio, 4)}
+            return {**report, **summary, "charge_limit_ratio": round(ratio, 4), "thermal_policy": policy}
 
-    def replace_pack_rating(self, pack_index: int = 0, rating_v: float = 3.35, rack_id: str | None = None) -> dict:
-        """更换整包电芯并立即刷新降额基线。"""
+    def replace_pack_rating(
+        self,
+        pack_index: int = 0,
+        rating_v: float = 3.35,
+        rack_id: str | None = None,
+        scope: str = "local",
+    ) -> dict:
+        """更换整包电芯，并在同一调用内原子重标和切换三项热策略。"""
 
         with self._lock:
             op_id = self.ids.next()
             rack = self._rack(rack_id)
-            change = rack.replace_pack_rating(pack_index, rating_v)
-            baseline = self.temp.apply_temperature(rack.temperature_c(), self.clock.now(), rack.rating_v(), rack.rating_epoch)
+            temp = self._temp(rack_id)
+            change = rack.replace_pack_rating(pack_index, rating_v, scope=scope)
+            policy = temp.activate_ratings(
+                rack.pack_ratings(),
+                self.clock.now(),
+                scope=scope,
+                reason="replace_pack_rating",
+            )
+            thermal = self._activate_station_thermal_policy()
+            self._publish_thermal_audit(
+                op_id,
+                "baseline_refresh_committed",
+                change,
+                policy,
+                thermal.get("applied", {}),
+            )
+            baseline_detail = {
+                "policy": policy,
+                "pcs": thermal.get("applied"),
+                "before": change["before"],
+                "after": change["rating_map"],
+                "selected_refresh_scope": policy["selected_refresh_scope"],
+                "selection_reason": change["reason"],
+                "switched_together": {
+                    "derate": policy["charge_limit_ratio"],
+                    "charge_current_max_a": policy["charge_current_max_a"],
+                    "cooling_start_c": policy["cooling_start_c"],
+                },
+            }
             steps = [
                 {"component": "rack", "action": "replace_pack", "detail": change},
-                {"component": "temp", "action": "baseline_refresh", "detail": baseline},
+                {"component": "temp", "action": "baseline_refresh", "detail": baseline_detail},
             ]
             report = {"station": self.station, "ok": True, "steps": steps, "violations": []}
             summary = self._record_operation(op_id, "replace_pack", report)
-            return {**report, **summary}
+            return {
+                **report,
+                **summary,
+                "thermal_policy": policy,
+                "pcs_thermal_policy": thermal.get("applied"),
+            }
 
     def calibrate_soc(self, soc_pct: float, source: str = "manual") -> dict:
         """登记一次 SOC 校准并按新基准重估。"""
@@ -563,9 +720,10 @@ class Platform:
             ratios: dict[str, float] = {}
             trips: list[str] = []
             for rack_id, rack in self.racks.items():
-                applied = self.temp.apply_temperature(rack.temperature_c(), now, rack.rating_v(), rack.rating_epoch)
-                temperatures[rack_id] = applied["temperature_c"]
-                ratios[rack_id] = round(self.temp.charge_limit_ratio(), 4)
+                temp = self._temp(rack_id)
+                applied = temp.apply_pack_temperatures(self._pack_readings(rack), now)
+                temperatures[rack_id] = round(max(item["temperature_c"] for item in applied["packs"].values()), 2)
+                ratios[rack_id] = round(temp.charge_limit_ratio(), 4)
                 self.trend.append(f"{rack_id}.temperature", now, rack.temperature_c())
                 self.trend.append(f"{rack_id}.voltage", now, rack.voltage_v())
                 violations = self.bms.protection(rack)
@@ -575,6 +733,7 @@ class Platform:
                 self.bms.ready(rack)
                 estimate = self.soc.value(now)
                 rack.set_soc(estimate.soc_pct)
+            self._activate_station_thermal_policy()
             rolled = self.quota.roll(now)
             self.grid.monitor_frequency(50.0, now)
             self._persist()
@@ -718,9 +877,10 @@ class Platform:
     def pcs_snapshot(self) -> dict:
         return {**self.pcs.snapshot().as_dict(), "mode_matrix": self.pcs.state_machine.table.matrix()}
 
-    def temp_snapshot(self) -> dict:
-        rack = self._rack(DEFAULT_RACK)
-        return self.temp.snapshot(self.clock.now(), rack.rating_epoch).as_dict()
+    def temp_snapshot(self, rack_id: str | None = None) -> dict:
+        rack = self._rack(rack_id)
+        temp = self._temp(rack_id)
+        return temp.snapshot(self.clock.now(), rack.rating_epoch).as_dict()
 
     def fire_snapshot(self) -> dict:
         return self.fire.snapshot().as_dict()

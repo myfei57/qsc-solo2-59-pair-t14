@@ -12,6 +12,9 @@ class PcsSnapshot:
     state: str
     generation: int
     derate_ratio: float
+    current_max_a: float
+    thermal_policy: dict | None
+    thermal_history_count: int
     output_kw: float
     delivered_kw: float
     reactive_kvar: float
@@ -30,6 +33,9 @@ class PcsSnapshot:
             "state": self.state,
             "generation": self.generation,
             "derate_ratio": round(self.derate_ratio, 4),
+            "current_max_a": round(self.current_max_a, 3),
+            "thermal_policy": None if self.thermal_policy is None else dict(self.thermal_policy),
+            "thermal_history_count": self.thermal_history_count,
             "output_kw": round(self.output_kw, 3),
             "delivered_kw": round(self.delivered_kw, 3),
             "reactive_kvar": round(self.reactive_kvar, 3),

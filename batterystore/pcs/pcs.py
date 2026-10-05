@@ -36,6 +36,8 @@ class Pcs:
         self._cut = CutOff()
         self._protection = PcsProtection(limits)
         self._derate = DerateFactor(1.0, {})
+        self._thermal_policy = None
+        self._thermal_history: list[dict] = []
         self._transfers = 0
 
     @property
@@ -115,6 +117,45 @@ class Pcs:
         self._power.with_derate(self._derate.ratio)
         return self._derate
 
+    def apply_thermal_policy(self, policy: dict) -> dict:
+        """同事务切换降额系数与充电电流上限。
+
+        调用方必须先在温控侧算出不可拆分的策略快照；这里不再二次解释阈值，
+        避免功率系数已放开而电流阶梯仍使用旧上限。
+        """
+
+        factor = self.apply_derate(temperature=float(policy["charge_limit_ratio"]), grid=1.0)
+        current = self._ladder.set_max_a(float(policy["charge_current_max_a"]))
+        applied = {
+            "generation": policy.get("generation", "unknown"),
+            "policy_epoch": int(policy.get("policy_epoch", 0)),
+            "scope": policy.get("scope", "unknown"),
+            "derate": factor.as_dict(),
+            "current_limit": {
+                **current,
+                "configured_max_a": round(self._ladder.configured_max_a, 3),
+            },
+            "cooling": {
+                "required": bool(policy.get("cooling_required", False)),
+                "start_c": round(float(policy["cooling_start_c"]), 3),
+                "stop_c": round(float(policy["cooling_stop_c"]), 3),
+            },
+        }
+        self._thermal_policy = applied
+        self._thermal_history.append(dict(applied))
+        applied["history_count"] = len(self._thermal_history)
+        return applied
+
+    def thermal_policy(self) -> dict | None:
+        """返回当前生效的热策略。"""
+
+        return None if self._thermal_policy is None else dict(self._thermal_policy)
+
+    def thermal_history(self) -> list[dict]:
+        """返回 PCS 侧热策略切换记录。"""
+
+        return [dict(item) for item in self._thermal_history]
+
     def trip(self, reason: str) -> dict:
         """执行跳闸：先切到跳闸态再分断接触器。"""
 
@@ -141,6 +182,9 @@ class Pcs:
             state=self._state.state,
             generation=self._state.generation,
             derate_ratio=self._derate.ratio,
+            current_max_a=self._ladder.max_a,
+            thermal_policy=self.thermal_policy(),
+            thermal_history_count=len(self.thermal_history()),
             output_kw=self._power.output_kw(),
             delivered_kw=self._power.delivered_kw(),
             reactive_kvar=self._power.reactive_kvar(),
